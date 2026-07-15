@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_urbanchat_sheet_sync_log_list" model="ir.ui.view">
+        <field name="name">urbanchat.sheet.sync.log.list</field>
+        <field name="model">urbanchat.sheet.sync.log</field>
+        <field name="arch" type="xml">
+            <list decoration-danger="status == 'error'"
+                  decoration-muted="status == 'skipped'"
+                  decoration-success="status in ('created','updated')">
+                <field name="sync_date"/>
+                <field name="config_id"/>
+                <field name="row_number"/>
+                <field name="status"/>
+                <field name="lead_id"/>
+                <field name="raw_owner_name"/>
+                <field name="matched_employee_id"/>
+                <field name="fallback_team_id"/>
+                <field name="message"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="action_urbanchat_sheet_sync_log" model="ir.actions.act_window">
+        <field name="name">Urban Chat Sync Log</field>
+        <field name="res_model">urbanchat.sheet.sync.log</field>
+        <field name="view_mode">list</field>
+    </record>
+
+</odoo>

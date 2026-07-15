@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <menuitem id="menu_urbanchat_gsheet_config"
+              name="Urban Chat Sheet Connectors"
+              parent="custom_leads_19.menu_leads_root"
+              action="action_urbanchat_gsheet_config"
+              sequence="90"
+              groups="custom_leads_19.group_super_admin,custom_leads_19.group_lead_manager"/>
+
+    <menuitem id="menu_urbanchat_sheet_sync_log"
+              name="Urban Chat Sync Log"
+              parent="custom_leads_19.menu_leads_root"
+              action="action_urbanchat_sheet_sync_log"
+              sequence="91"
+              groups="custom_leads_19.group_super_admin,custom_leads_19.group_lead_manager"/>
+
+</odoo>

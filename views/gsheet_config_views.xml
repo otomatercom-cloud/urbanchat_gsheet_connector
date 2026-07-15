@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_urbanchat_gsheet_config_list" model="ir.ui.view">
+        <field name="name">urbanchat.gsheet.config.list</field>
+        <field name="model">urbanchat.gsheet.config</field>
+        <field name="arch" type="xml">
+            <list>
+                <field name="name"/>
+                <field name="connection_type"/>
+                <field name="duplicate_action"/>
+                <field name="last_sync_date"/>
+                <field name="last_sync_summary"/>
+                <field name="active" column_invisible="1"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_urbanchat_gsheet_config_form" model="ir.ui.view">
+        <field name="name">urbanchat.gsheet.config.form</field>
+        <field name="model">urbanchat.gsheet.config</field>
+        <field name="arch" type="xml">
+            <form string="Urban Chat — Google Sheet Connector">
+                <header>
+                    <button name="action_sync_now" string="Sync Now" type="object"
+                            class="btn-primary"/>
+                </header>
+                <sheet>
+                    <div class="oe_button_box" name="button_box">
+                        <button name="action_view_sync_log" type="object"
+                                class="oe_stat_button" icon="fa-list-alt">
+                            <field name="sync_log_count" widget="statinfo" string="Sync Log"/>
+                        </button>
+                    </div>
+                    <div class="oe_title">
+                        <label for="name"/>
+                        <h1><field name="name"/></h1>
+                    </div>
+                    <group>
+                        <group string="Status">
+                            <field name="active"/>
+                            <field name="last_sync_date"/>
+                            <field name="last_sync_summary"/>
+                            <field name="sync_interval_minutes"/>
+                        </group>
+                        <group string="Connection">
+                            <field name="connection_type"/>
+                            <field name="csv_url" invisible="connection_type != 'csv'"
+                                   required="connection_type == 'csv'"/>
+                            <field name="spreadsheet_id" invisible="connection_type != 'oauth'"
+                                   required="connection_type == 'oauth'"/>
+                            <field name="sheet_range" invisible="connection_type != 'oauth'"
+                                   required="connection_type == 'oauth'"/>
+                            <field name="oauth_client_id" invisible="connection_type != 'oauth'"
+                                   required="connection_type == 'oauth'" password="True"/>
+                            <field name="oauth_client_secret" invisible="connection_type != 'oauth'"
+                                   required="connection_type == 'oauth'" password="True"/>
+                            <field name="oauth_refresh_token" invisible="connection_type != 'oauth'"
+                                   required="connection_type == 'oauth'" password="True"/>
+                        </group>
+                    </group>
+                    <group>
+                        <group string="Duplicate Handling">
+                            <field name="duplicate_check_field"/>
+                            <field name="duplicate_action"/>
+                        </group>
+                        <group string="Defaults">
+                            <field name="default_quality"/>
+                            <field name="default_source_id"/>
+                        </group>
+                    </group>
+                    <group string="Owner Matching">
+                        <field name="default_team_ids" widget="many2many_tags"/>
+                        <field name="include_team_leads_in_fallback"
+                               invisible="not default_team_ids"/>
+                        <div colspan="2" class="text-muted" style="margin-top:-8px;">
+                            The sheet's "Lead Owner Name" cell is matched by exact name
+                            (case-insensitive) against Admission Officers who are members
+                            of a Team. If no match is found, the lead is instead handed to
+                            the next person in the team(s) above, in round-robin rotation.
+                            Leave the team(s) field empty to leave unmatched leads unassigned.
+                        </div>
+                    </group>
+                    <notebook>
+                        <page string="Column Mapping">
+                            <field name="column_map_ids">
+                                <list editable="bottom">
+                                    <field name="sequence" widget="handle"/>
+                                    <field name="sheet_header"/>
+                                    <field name="target_field"/>
+                                </list>
+                            </field>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_urbanchat_gsheet_config" model="ir.actions.act_window">
+        <field name="name">Urban Chat Sheet Connectors</field>
+        <field name="res_model">urbanchat.gsheet.config</field>
+        <field name="view_mode">list,form</field>
+    </record>
+
+</odoo>
