@@ -33,6 +33,7 @@ class UrbanchatGsheetColumnMap(models.Model):
         ('parent_number', 'Parent Number'),
         ('email_address', 'Email'),
         ('course_interested', 'Course Interested'),
+        ('call_response', 'Response (lead "Response" text field)'),
         ('leads_source', 'Lead Source (matched by name)'),
         ('lead_owner_name', 'Lead Owner Name (matched to Admission Officer)'),
         ('skip', "Don't Import — Reference Only"),
