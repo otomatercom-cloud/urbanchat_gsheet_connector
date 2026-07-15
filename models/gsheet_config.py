@@ -6,7 +6,7 @@ from datetime import timedelta
 import requests
 
 from odoo import models, fields, api, _
-from odoo.exceptions import UserError
+from odoo.exceptions import UserError, ValidationError
 
 _logger = logging.getLogger(__name__)
 
@@ -88,7 +88,20 @@ class UrbanchatGsheetConfig(models.Model):
     duplicate_action = fields.Selection([
         ('skip', 'Skip'),
         ('update', 'Update Existing'),
-    ], default='skip', required=True, string='On Duplicate')
+        ('reattempt', 'Send to Re-Attempt'),
+    ], default='skip', required=True, string='On Duplicate',
+        help="Skip: ignore the row. Update Existing: overwrite the existing "
+             "lead's fields with the sheet values. Send to Re-Attempt: keep "
+             "the existing lead untouched and create an otomater.lead.reattempt "
+             "request (Pending Review) for the Team Lead to approve, exactly "
+             "like a duplicate entered manually.")
+
+    auto_create_source = fields.Boolean(
+        string='Auto-Create Missing Sources', default=True,
+        help="When the sheet's source column has a value that doesn't match "
+             "any existing Lead Source by name, create it automatically "
+             "(case-insensitive matching, so no duplicate sources are made). "
+             "If off, unmatched values fall back to the Default Lead Source.")
 
     default_source_id = fields.Many2one(
         'leads.sources', string='Default Lead Source',
@@ -104,6 +117,17 @@ class UrbanchatGsheetConfig(models.Model):
         return self.env['leads.logic']._fields['lead_quality'].selection
 
     # ── Owner matching + round-robin fallback ───────────────────────────────
+    owner_match_mode = fields.Selection([
+        ('exact', 'Exact Match'),
+        ('contains', 'Exact, then Name Contains'),
+    ], default='exact', required=True, string='Officer Name Matching',
+        help="Exact Match: the sheet's Lead Owner Name must equal the "
+             "Admission Officer's name (case/space-insensitive).\n"
+             "Exact, then Name Contains: if no exact match, also matches when "
+             "the sheet value is contained in the officer's name or vice "
+             "versa (e.g. sheet 'Anjali' matches officer 'Anjali Krishnan'). "
+             "If several officers match this way, the row is treated as "
+             "unmatched (round-robin fallback) and the ambiguity is logged.")
     default_team_ids = fields.Many2many(
         'lead.team', string='Fallback Team(s) (Round Robin)',
         help="If the sheet's 'Lead Owner Name' cell doesn't match any "
@@ -165,20 +189,141 @@ class UrbanchatGsheetConfig(models.Model):
         return rule._round_robin_member(team)
 
     def _match_employee_by_name(self, raw_name):
-        """Case-insensitive, whitespace-trimmed exact match of the sheet's
-        Lead Owner Name against hr.employee.name, scoped to employees who
-        are actually members of a lead.team (i.e. known Admission Officers),
-        rather than any employee in the company."""
+        """Match the sheet's Lead Owner Name against Admission Officers
+        (hr.employee records that are members of a lead.team).
+
+        Returns (employee_or_False, note_or_'').
+
+        Pass 1 — always: case-insensitive, whitespace-trimmed EXACT match.
+        Pass 2 — only when owner_match_mode == 'contains' and pass 1 found
+        nothing: substring match in either direction (sheet value inside the
+        officer's name, or the officer's name inside the sheet value).
+        If pass 2 matches more than one distinct officer, that's ambiguous:
+        no match is returned and the note says who collided, so the lead
+        falls through to the round-robin fallback instead of guessing.
+        """
         raw_name = (raw_name or '').strip()
         if not raw_name:
-            return False
+            return False, ''
+        target = ' '.join(raw_name.lower().split())
+
         members = self.env['lead.team.member'].search([])
-        target = raw_name.lower()
+        candidates = {}  # employee_id -> employee (distinct officers)
         for member in members:
-            emp_name = (member.employee_id.name or '').strip()
-            if emp_name and emp_name.lower() == target:
-                return member.employee_id
-        return False
+            emp = member.employee_id
+            emp_name = ' '.join((emp.name or '').lower().split())
+            if emp_name and emp_name == target:
+                return emp, ''
+            if emp_name:
+                candidates[emp.id] = (emp, emp_name)
+
+        if self.owner_match_mode != 'contains':
+            return False, ''
+
+        hits = []
+        for emp, emp_name in candidates.values():
+            if target in emp_name or emp_name in target:
+                hits.append(emp)
+        if len(hits) == 1:
+            return hits[0], _("Matched by name-contains: '%s' ~ '%s'") % (
+                raw_name, hits[0].name)
+        if len(hits) > 1:
+            names = ', '.join(e.name for e in hits[:5])
+            return False, _(
+                "Ambiguous owner name '%s' — contains-matched %s officers "
+                "(%s). Used round-robin fallback instead."
+            ) % (raw_name, len(hits), names)
+        return False, ''
+
+    # ── Source resolution (match or auto-create, no duplicates) ─────────────
+    def _resolve_source(self, cell, source_cache):
+        """Return a leads.sources id for the sheet cell value.
+
+        Matching is case-insensitive on the trimmed value. If nothing
+        matches and auto_create_source is on, the source is created once —
+        source_cache (shared across the whole sync run) plus a re-search
+        right before create guarantee no duplicate sources are made even
+        when the same new value appears on many rows.
+        """
+        cell = (cell or '').strip()
+        if not cell:
+            return False
+        key = cell.lower()
+        if key in source_cache:
+            return source_cache[key]
+
+        Source = self.env['leads.sources']
+        source = Source.search([('name', '=ilike', cell)], limit=1)
+        if not source and self.auto_create_source:
+            # Re-check just before creating (another cron/user may have
+            # added it since the cache was built).
+            source = Source.search([('name', '=ilike', cell)], limit=1)
+            if not source:
+                source = Source.create({'name': cell})
+                _logger.info(
+                    "urbanchat.gsheet.config: auto-created lead source '%s' "
+                    "(config %s)", cell, self.name)
+        source_cache[key] = source.id if source else False
+        return source_cache[key]
+
+    # ── Robust duplicate detection (same rules as leads.logic.create) ───────
+    def _find_existing_lead(self, vals):
+        """Return (existing_lead_or_False, duplicate_type_or_False).
+
+        Mirrors the duplicate rules that custom_leads_19 enforces inside
+        leads.logic.create(): phone matched on the LAST 10 DIGITS (so
+        '+91 98765 43210' and '9876543210' collide), email matched
+        case-insensitively. Checking here first means duplicates are handled
+        per this connector's On Duplicate setting instead of tripping the
+        ValidationError inside create()."""
+        Leads = self.env['leads.logic'].sudo()
+        phone = (vals.get('phone_number') or '').replace(' ', '')
+        email = vals.get('email_address') or ''
+
+        phone_match = False
+        if phone and self.duplicate_check_field == 'phone_number':
+            last_10 = phone[-10:] if len(phone) >= 10 else phone
+            phone_match = Leads.search(
+                [('phone_number', 'like', '%' + last_10)], limit=1)
+
+        email_match = False
+        if email and (self.duplicate_check_field == 'email_address'
+                      or phone_match):
+            email_match = Leads.search(
+                [('email_address', '=ilike', email)], limit=1)
+
+        if phone_match and email_match and phone_match.id == email_match.id:
+            return phone_match, 'both'
+        if phone_match:
+            return phone_match, 'phone'
+        if self.duplicate_check_field == 'email_address' and email_match:
+            return email_match, 'email'
+        return False, False
+
+    # ── Duplicate → Re-Attempt ───────────────────────────────────────────────
+    def _create_reattempt_for_duplicate(self, existing, vals, duplicate_type,
+                                        owner_name_raw):
+        """Create an otomater.lead.reattempt request for a duplicate sheet
+        row — same field pattern the manual duplicate-interception in
+        custom_leads_19 uses, so it lands in the normal Pending Review
+        queue for the Team Lead."""
+        reattempt = self.env['otomater.lead.reattempt'].sudo().create({
+            'lead_id': existing.id,
+            'existing_owner_id': existing.lead_owner.id if existing.lead_owner else False,
+            'requested_owner_id': self.env.user.employee_id.id
+                if self.env.user.employee_id else False,
+            'request_date': fields.Datetime.now(),
+            'source_id': vals.get('leads_source', False),
+            'remarks': _("Auto-created by Urban Chat sheet sync (%s). "
+                         "Sheet owner name: %s") % (
+                self.name, owner_name_raw or _('(empty)')),
+            'duplicate_type': duplicate_type or 'phone',
+            'mobile': vals.get('phone_number', ''),
+            'email': vals.get('email_address', ''),
+            'review_status': 'pending_review',
+            're_attempt_count': (existing.re_attempt_count or 0) + 1,
+        })
+        return reattempt
 
     # ── Fetching the sheet ───────────────────────────────────────────────────
     def _get_oauth_access_token(self):
@@ -238,7 +383,7 @@ class UrbanchatGsheetConfig(models.Model):
             raise UserError(_("Configure the Column Mapping before syncing."))
 
         rows = self._fetch_rows()
-        result = {'created': 0, 'updated': 0, 'skipped': 0, 'errors': 0}
+        result = {'created': 0, 'updated': 0, 'skipped': 0, 'reattempt': 0, 'errors': 0}
         if not rows:
             self.write({
                 'last_sync_date': fields.Datetime.now(),
@@ -263,6 +408,7 @@ class UrbanchatGsheetConfig(models.Model):
         Leads = self.env['leads.logic']
         Log = self.env['urbanchat.sheet.sync.log']
         team_cycle_idx = 0
+        source_cache = {}  # lower(name) -> leads.sources id, shared for the run
 
         for row_num, row in enumerate(data_rows, start=2):  # row 1 = header
             if not any((c or '').strip() for c in row):
@@ -278,10 +424,9 @@ class UrbanchatGsheetConfig(models.Model):
                     if line.target_field == 'lead_owner_name':
                         owner_name_raw = cell
                     elif line.target_field == 'leads_source':
-                        source = self.env['leads.sources'].search(
-                            [('name', '=ilike', cell)], limit=1)
-                        if source:
-                            vals['leads_source'] = source.id
+                        source_id = self._resolve_source(cell, source_cache)
+                        if source_id:
+                            vals['leads_source'] = source_id
                     else:
                         vals[line.target_field] = cell
 
@@ -296,30 +441,18 @@ class UrbanchatGsheetConfig(models.Model):
                         'config_id': self.id, 'row_number': row_num, 'status': 'error',
                         'raw_owner_name': owner_name_raw,
                         'message': _("No Lead Source resolved for this row "
-                                     "(sheet value didn't match, and no Default "
-                                     "Lead Source is set)."),
+                                     "(sheet value didn't match, auto-create is "
+                                     "off, and no Default Lead Source is set)."),
                     })
                     continue
 
                 vals.setdefault('lead_quality', self.default_quality or 'new')
                 vals.setdefault('name', vals.get('phone_number') or 'Urban Chat Lead')
 
-                dup_field = self.duplicate_check_field
-                existing = False
-                if vals.get(dup_field):
-                    existing = Leads.search([(dup_field, '=', vals[dup_field])], limit=1)
-
-                # ── Resolve owner: name match first, round-robin fallback second ──
-                matched_employee = self._match_employee_by_name(owner_name_raw)
-                fallback_team = False
-                if matched_employee:
-                    vals['lead_owner'] = matched_employee.id
-                elif self.default_team_ids and not (existing and self.duplicate_action == 'skip'):
-                    fallback_team = self._team_at_cycle_index(team_cycle_idx)
-                    team_cycle_idx += 1
-                    rr_employee = self._pick_team_round_robin(fallback_team)
-                    if rr_employee:
-                        vals['lead_owner'] = rr_employee.id
+                # ── Duplicate check FIRST (same last-10 phone / ilike email
+                #    rules as leads.logic.create), so duplicates never reach
+                #    create() and its ValidationError ─────────────────────
+                existing, dup_type = self._find_existing_lead(vals)
 
                 if existing:
                     if self.duplicate_action == 'skip':
@@ -327,26 +460,81 @@ class UrbanchatGsheetConfig(models.Model):
                         Log.create({
                             'config_id': self.id, 'row_number': row_num, 'lead_id': existing.id,
                             'status': 'skipped', 'raw_owner_name': owner_name_raw,
-                            'message': _("Duplicate by %s — skipped.") % dup_field,
+                            'message': _("Duplicate by %s — skipped.") % (dup_type or self.duplicate_check_field),
                         })
                         continue
-                    existing.write(vals)
+
+                    if self.duplicate_action == 'reattempt':
+                        with self.env.cr.savepoint():
+                            reattempt = self._create_reattempt_for_duplicate(
+                                existing, vals, dup_type, owner_name_raw)
+                        result['reattempt'] += 1
+                        Log.create({
+                            'config_id': self.id, 'row_number': row_num,
+                            'lead_id': existing.id, 'status': 'reattempt',
+                            'raw_owner_name': owner_name_raw,
+                            'reattempt_id': reattempt.id,
+                            'message': _("Duplicate by %s — Re-Attempt %s created "
+                                         "(Pending Review).") % (
+                                dup_type or self.duplicate_check_field, reattempt.name),
+                        })
+                        continue
+
+                    # duplicate_action == 'update': only re-assign owner on a
+                    # confirmed name match — never burn a round-robin slot on
+                    # a lead that already has an owner.
+                    matched_employee, match_note = self._match_employee_by_name(owner_name_raw)
+                    if matched_employee:
+                        vals['lead_owner'] = matched_employee.id
+                    with self.env.cr.savepoint():
+                        existing.write(vals)
                     result['updated'] += 1
                     Log.create({
                         'config_id': self.id, 'row_number': row_num, 'lead_id': existing.id,
                         'status': 'updated', 'raw_owner_name': owner_name_raw,
                         'matched_employee_id': matched_employee.id if matched_employee else False,
-                        'fallback_team_id': fallback_team.id if fallback_team else False,
+                        'message': match_note or False,
                     })
                     continue
 
-                lead = Leads.create(vals)
+                # ── New lead: owner name match first, round-robin second ──
+                matched_employee, match_note = self._match_employee_by_name(owner_name_raw)
+                fallback_team = False
+                if matched_employee:
+                    vals['lead_owner'] = matched_employee.id
+                elif self.default_team_ids:
+                    fallback_team = self._team_at_cycle_index(team_cycle_idx)
+                    team_cycle_idx += 1
+                    rr_employee = self._pick_team_round_robin(fallback_team)
+                    if rr_employee:
+                        vals['lead_owner'] = rr_employee.id
+
+                try:
+                    with self.env.cr.savepoint():
+                        lead = Leads.create(vals)
+                except ValidationError as ve:
+                    # A duplicate variant slipped past our check (e.g. the
+                    # base module matched on a rule this config isn't
+                    # checking). leads.logic.create() has ALREADY created a
+                    # re-attempt in its own cursor before raising — record
+                    # that instead of an error.
+                    result['reattempt'] += 1
+                    Log.create({
+                        'config_id': self.id, 'row_number': row_num,
+                        'status': 'reattempt', 'raw_owner_name': owner_name_raw,
+                        'message': _("Duplicate intercepted by lead creation "
+                                     "rules — Re-Attempt auto-created. %s"
+                                     ) % str(ve)[:300],
+                    })
+                    continue
+
                 result['created'] += 1
                 Log.create({
                     'config_id': self.id, 'row_number': row_num, 'lead_id': lead.id,
                     'status': 'created', 'raw_owner_name': owner_name_raw,
                     'matched_employee_id': matched_employee.id if matched_employee else False,
                     'fallback_team_id': fallback_team.id if fallback_team else False,
+                    'message': match_note or False,
                 })
 
                 if fallback_team and lead:
@@ -373,9 +561,11 @@ class UrbanchatGsheetConfig(models.Model):
                     'message': str(e)[:500],
                 })
 
-        summary = _("Created %(c)s, Updated %(u)s, Skipped %(s)s, Errors %(e)s") % {
+        summary = _("Created %(c)s, Updated %(u)s, Skipped %(s)s, "
+                    "Re-Attempts %(r)s, Errors %(e)s") % {
             'c': result['created'], 'u': result['updated'],
-            's': result['skipped'], 'e': result['errors'],
+            's': result['skipped'], 'r': result['reattempt'],
+            'e': result['errors'],
         }
         self.write({
             'last_sync_date': fields.Datetime.now(),
@@ -384,14 +574,75 @@ class UrbanchatGsheetConfig(models.Model):
         return result
 
     # ── Public actions ───────────────────────────────────────────────────────
+    def action_test_connection(self):
+        """Fetch the sheet and report what was found — WITHOUT creating,
+        updating, or importing anything. Verifies the connection works and
+        that the configured column headers actually exist in row 1."""
+        self.ensure_one()
+        rows = self._fetch_rows()  # raises a clear UserError on any failure
+
+        if not rows:
+            return {
+                'type': 'ir.actions.client',
+                'tag': 'display_notification',
+                'params': {
+                    'title': _('Connection OK — but sheet is empty'),
+                    'message': _("The sheet was reached successfully but "
+                                 "returned no rows at all."),
+                    'type': 'warning',
+                    'sticky': True,
+                },
+            }
+
+        header = [(h or '').strip() for h in rows[0]]
+        header_lower = [h.lower() for h in header]
+        data_row_count = sum(
+            1 for r in rows[1:] if any((c or '').strip() for c in r))
+
+        found, missing = [], []
+        for line in self.column_map_ids:
+            key = (line.sheet_header or '').strip().lower()
+            (found if key in header_lower else missing).append(
+                line.sheet_header)
+
+        parts = [
+            _("✓ Sheet reached successfully."),
+            _("Header columns (%(n)s): %(h)s") % {
+                'n': len(header), 'h': ', '.join(header) or _('(none)')},
+            _("Data rows (non-blank): %s") % data_row_count,
+        ]
+        if found:
+            parts.append(_("✓ Mapped headers found: %s") % ', '.join(found))
+        if missing:
+            parts.append(_("✗ Mapped headers NOT in sheet: %s")
+                         % ', '.join(missing))
+        if not self.column_map_ids:
+            parts.append(_("⚠ No column mapping configured yet."))
+
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _('Test Connection — %s')
+                         % ('Issues Found' if missing or not self.column_map_ids
+                            else 'All Good'),
+                'message': '\n'.join(parts),
+                'type': 'warning' if (missing or not self.column_map_ids)
+                        else 'success',
+                'sticky': True,
+            },
+        }
+
     def action_sync_now(self):
         self.ensure_one()
         result = self._sync()
         message = _(
-            "Created: %(c)s   Updated: %(u)s   Skipped: %(s)s   Errors: %(e)s"
+            "Created: %(c)s   Updated: %(u)s   Skipped: %(s)s   "
+            "Re-Attempts: %(r)s   Errors: %(e)s"
         ) % {
             'c': result['created'], 'u': result['updated'],
-            's': result['skipped'], 'e': result['errors'],
+            's': result['skipped'], 'r': result['reattempt'],
+            'e': result['errors'],
         }
         return {
             'type': 'ir.actions.client',

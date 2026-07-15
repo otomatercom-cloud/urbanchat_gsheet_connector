@@ -17,8 +17,13 @@ class UrbanchatSheetSyncLog(models.Model):
         ('created', 'Created'),
         ('updated', 'Updated (Duplicate)'),
         ('skipped', 'Skipped (Duplicate)'),
+        ('reattempt', 'Sent to Re-Attempt'),
         ('error', 'Error'),
     ], required=True, string='Status')
+    reattempt_id = fields.Many2one(
+        'otomater.lead.reattempt', string='Re-Attempt Request',
+        help="The Pending Review re-attempt created because this sheet row "
+             "duplicated an existing lead.")
     raw_owner_name = fields.Char(string='Sheet "Lead Owner Name"')
     matched_employee_id = fields.Many2one('hr.employee', string='Matched Admission Officer')
     fallback_team_id = fields.Many2one(

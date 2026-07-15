@@ -7,12 +7,14 @@
         <field name="arch" type="xml">
             <list decoration-danger="status == 'error'"
                   decoration-muted="status == 'skipped'"
+                  decoration-warning="status == 'reattempt'"
                   decoration-success="status in ('created','updated')">
                 <field name="sync_date"/>
                 <field name="config_id"/>
                 <field name="row_number"/>
                 <field name="status"/>
                 <field name="lead_id"/>
+                <field name="reattempt_id"/>
                 <field name="raw_owner_name"/>
                 <field name="matched_employee_id"/>
                 <field name="fallback_team_id"/>
