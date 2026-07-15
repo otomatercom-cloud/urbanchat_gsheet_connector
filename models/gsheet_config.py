@@ -1,5 +1,6 @@
 import csv
 import io
+import re
 import logging
 from datetime import timedelta
 
@@ -326,6 +327,35 @@ class UrbanchatGsheetConfig(models.Model):
         return reattempt
 
     # ── Fetching the sheet ───────────────────────────────────────────────────
+    @api.model
+    def _normalize_csv_url(self, url):
+        """Accept any of the common Google Sheet link shapes and return a
+        direct CSV URL:
+
+        * Already a published/export CSV link  -> unchanged
+        * Normal sheet link (docs.google.com/spreadsheets/d/<ID>/edit#gid=N)
+          -> converted to /export?format=csv&gid=N  (works when the sheet's
+          sharing is 'Anyone with the link — Viewer', no publish needed)
+        """
+        url = (url or '').strip()
+        if not url:
+            return url
+        if 'output=csv' in url or 'format=csv' in url or '/pub?' in url:
+            return url
+        m = re.search(r'docs\.google\.com/spreadsheets/d/([a-zA-Z0-9\-_]+)', url)
+        if m:
+            sheet_id = m.group(1)
+            gid_match = re.search(r'[#&?]gid=(\d+)', url)
+            gid = gid_match.group(1) if gid_match else '0'
+            return ('https://docs.google.com/spreadsheets/d/%s/export'
+                    '?format=csv&gid=%s' % (sheet_id, gid))
+        return url
+
+    @api.model
+    def _looks_like_html(self, text):
+        head = (text or '').lstrip()[:300].lower()
+        return head.startswith('<!doctype') or head.startswith('<html') \
+            or '<head' in head[:100]
     def _get_oauth_access_token(self):
         self.ensure_one()
         if not (self.oauth_client_id and self.oauth_client_secret and self.oauth_refresh_token):
@@ -354,12 +384,34 @@ class UrbanchatGsheetConfig(models.Model):
         if self.connection_type == 'csv':
             if not self.csv_url:
                 raise UserError(_("Set the Published CSV URL first."))
+            fetch_url = self._normalize_csv_url(self.csv_url)
             try:
-                resp = requests.get(self.csv_url, timeout=30)
+                resp = requests.get(fetch_url, timeout=30, allow_redirects=True)
                 resp.raise_for_status()
             except requests.RequestException as e:
-                raise UserError(_("Could not fetch the CSV sheet: %s") % e)
+                raise UserError(_(
+                    "Could not fetch the CSV sheet: %s\n\n"
+                    "If this is a 401/403/404: the sheet is not reachable "
+                    "without login. Either set Share > 'Anyone with the "
+                    "link — Viewer', or use File > Share > Publish to web "
+                    "> CSV and paste that link.") % e)
             content = resp.content.decode('utf-8-sig', errors='replace')
+            content_type = (resp.headers.get('Content-Type') or '').lower()
+            if 'html' in content_type or self._looks_like_html(content):
+                raise UserError(_(
+                    "Google returned a web page instead of CSV data.\n\n"
+                    "This usually means the sheet is NOT publicly "
+                    "reachable — Google is showing its login/consent page.\n\n"
+                    "Fix one of these ways:\n"
+                    "1. In the sheet: Share > General access > 'Anyone with "
+                    "the link' > Viewer, then paste the normal sheet URL "
+                    "here (it is converted to a CSV export link "
+                    "automatically), or\n"
+                    "2. File > Share > Publish to web > select the tab > "
+                    "CSV > Publish, and paste that published link, or\n"
+                    "3. Keep the sheet private and use the Google OAuth "
+                    "connection method instead.\n\n"
+                    "URL actually fetched: %s") % fetch_url)
             return list(csv.reader(io.StringIO(content)))
         else:  # oauth
             if not (self.spreadsheet_id and self.sheet_range):
@@ -594,7 +646,7 @@ class UrbanchatGsheetConfig(models.Model):
                 },
             }
 
-        header = [(h or '').strip() for h in rows[0]]
+        header = [(h or '').strip()[:40] for h in rows[0]]
         header_lower = [h.lower() for h in header]
         data_row_count = sum(
             1 for r in rows[1:] if any((c or '').strip() for c in r))
