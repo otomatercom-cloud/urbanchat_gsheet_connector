@@ -92,6 +92,14 @@
                             Leave the team(s) field empty to leave unmatched leads unassigned.
                         </div>
                     </group>
+                    <group string="Owner Name Aliases">
+                        <field name="owner_alias_ids" nolabel="1" colspan="2">
+                            <list editable="bottom">
+                                <field name="alias"/>
+                                <field name="employee_id"/>
+                            </list>
+                        </field>
+                    </group>
                     <notebook>
                         <page string="Column Mapping">
                             <field name="column_map_ids">

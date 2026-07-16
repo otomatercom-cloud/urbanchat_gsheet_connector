@@ -151,6 +151,12 @@ class UrbanchatGsheetConfig(models.Model):
     last_sync_date = fields.Datetime(string='Last Synced', readonly=True, copy=False)
     last_sync_summary = fields.Char(string='Last Sync Result', readonly=True, copy=False)
 
+    owner_alias_ids = fields.One2many(
+        'urbanchat.owner.alias', 'config_id', string='Owner Name Aliases',
+        help="Alternate spellings agents use in the sheet, mapped to the "
+             "right Admission Officer — e.g. 'FOUSIYA LATHEEF' -> "
+             "FOUSIYA T Y. Aliases are checked BEFORE exact/contains "
+             "matching.")
     sync_log_ids = fields.One2many('urbanchat.sheet.sync.log', 'config_id', string='Sync Log')
     sync_log_count = fields.Integer(compute='_compute_sync_log_count')
 
@@ -220,22 +226,36 @@ class UrbanchatGsheetConfig(models.Model):
         if not target:
             return False, ''
 
-        members = self.env['lead.team.member'].search([])
+        # Pass 0 — explicit aliases configured on this connector win over
+        # everything (normalized comparison, so punctuation/case-proof).
+        for alias in self.owner_alias_ids:
+            if self._normalize_person_name(alias.alias) == target \
+                    and alias.employee_id:
+                return alias.employee_id, _(
+                    "Matched via alias: '%s' → %s") % (
+                        raw_name, alias.employee_id.name)
+
+        # Candidate pool = Admission Officers (team members) AND Team Leads —
+        # both can be named as the lead owner in the sheet.
         candidates = {}  # employee_id -> (employee, normalized name)
-        for member in members:
+        for member in self.env['lead.team.member'].search([]):
             emp = member.employee_id
-            emp_name = self._normalize_person_name(emp.name)
+            if emp:
+                candidates[emp.id] = (emp, self._normalize_person_name(emp.name))
+        for team in self.env['lead.team'].search([]):
+            for emp in team.team_lead_ids:
+                candidates[emp.id] = (emp, self._normalize_person_name(emp.name))
+
+        for emp, emp_name in candidates.values():
             if emp_name and emp_name == target:
                 return emp, ''
-            if emp_name:
-                candidates[emp.id] = (emp, emp_name)
 
         if self.owner_match_mode != 'contains':
             return False, ''
 
         hits = []
         for emp, emp_name in candidates.values():
-            if target in emp_name or emp_name in target:
+            if emp_name and (target in emp_name or emp_name in target):
                 hits.append(emp)
         if len(hits) == 1:
             return hits[0], _("Matched by name-contains: '%s' ~ '%s'") % (
@@ -742,6 +762,10 @@ class UrbanchatGsheetConfig(models.Model):
             m.employee_id.name
             for m in self.env['lead.team.member'].search([])
             if m.employee_id.name))
+        tl_names = sorted(set(
+            emp.name
+            for team in self.env['lead.team'].search([])
+            for emp in team.team_lead_ids if emp.name))
 
         parts = [_("Distinct owner names in sheet: %s") % len(distinct)]
         if matched_lines:
@@ -751,12 +775,16 @@ class UrbanchatGsheetConfig(models.Model):
             parts.append(_("NOT MATCHED (%s) — these leads will go "
                            "round-robin:") % len(unmatched_lines))
             parts.extend(unmatched_lines)
-            parts.append(_("Matching only sees Admission Officers who are "
-                           "MEMBERS OF A LEAD TEAM. Current team members: "
-                           "%s") % (', '.join(officer_names) or _('(none!)')))
+            parts.append(_("Matching sees Admission Officers who are members "
+                           "of a Lead Team AND Team Leads. Officers: %s. "
+                           "Team Leads: %s") % (
+                ', '.join(officer_names) or _('(none)'),
+                ', '.join(tl_names) or _('(none)')))
             parts.append(_("To fix a name: add that person's Employee to a "
-                           "Lead Team, or rename so the names correspond "
-                           "(punctuation and case are ignored)."))
+                           "Lead Team, rename so the names correspond "
+                           "(punctuation and case are ignored), or add an "
+                           "Owner Name Alias on this connector — e.g. "
+                           "'Sajina Faizal' → SAJINA. A."))
 
         return {
             'type': 'ir.actions.client',
@@ -813,3 +841,27 @@ class UrbanchatGsheetConfig(models.Model):
                 _logger.exception(
                     "urbanchat.gsheet.config: scheduled sync failed for %s", config.name)
                 self.env.cr.rollback()
+
+class UrbanchatOwnerAlias(models.Model):
+    _name = 'urbanchat.owner.alias'
+    _description = 'Sheet Owner Name Alias -> Admission Officer'
+    _rec_name = 'alias'
+
+    config_id = fields.Many2one(
+        'urbanchat.gsheet.config', string='Connector', required=True,
+        ondelete='cascade')
+    alias = fields.Char(
+        string='Sheet Name Variant', required=True,
+        help="A name exactly as it appears in the sheet's Lead Owner Name "
+             "column (punctuation and case are ignored when matching), "
+             "e.g. 'FOUSIYA LATHEEF' or 'Sajina Faizal'.")
+    employee_id = fields.Many2one(
+        'hr.employee', string='Admission Officer', required=True,
+        help="The officer this variant refers to. Should be a member of a "
+             "Lead Team so the assignment behaves like a normal match.")
+
+    _sql_constraints = [
+        ('alias_config_uniq', 'unique(config_id, alias)',
+         'This alias already exists on this connector.'),
+    ]
+
