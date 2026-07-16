@@ -190,13 +190,25 @@ class UrbanchatGsheetConfig(models.Model):
         })
         return rule._round_robin_member(team)
 
+    @api.model
+    def _normalize_person_name(self, name):
+        """Lowercase, strip punctuation (dots, commas, hyphens...), collapse
+        whitespace — so 'SAJINA. A', 'Sajina A' and 'sajina.a' all compare
+        equal."""
+        name = (name or '').lower()
+        name = re.sub(r'[^a-z0-9]+', ' ', name)
+        return ' '.join(name.split())
+
     def _match_employee_by_name(self, raw_name):
         """Match the sheet's Lead Owner Name against Admission Officers
         (hr.employee records that are members of a lead.team).
 
         Returns (employee_or_False, note_or_'').
 
-        Pass 1 — always: case-insensitive, whitespace-trimmed EXACT match.
+        Names are compared punctuation-insensitively ('SAJINA. A' ==
+        'SAJINA A').
+
+        Pass 1 — always: normalized EXACT match.
         Pass 2 — only when owner_match_mode == 'contains' and pass 1 found
         nothing: substring match in either direction (sheet value inside the
         officer's name, or the officer's name inside the sheet value).
@@ -204,16 +216,15 @@ class UrbanchatGsheetConfig(models.Model):
         no match is returned and the note says who collided, so the lead
         falls through to the round-robin fallback instead of guessing.
         """
-        raw_name = (raw_name or '').strip()
-        if not raw_name:
+        target = self._normalize_person_name(raw_name)
+        if not target:
             return False, ''
-        target = ' '.join(raw_name.lower().split())
 
         members = self.env['lead.team.member'].search([])
-        candidates = {}  # employee_id -> employee (distinct officers)
+        candidates = {}  # employee_id -> (employee, normalized name)
         for member in members:
             emp = member.employee_id
-            emp_name = ' '.join((emp.name or '').lower().split())
+            emp_name = self._normalize_person_name(emp.name)
             if emp_name and emp_name == target:
                 return emp, ''
             if emp_name:
@@ -682,6 +693,79 @@ class UrbanchatGsheetConfig(models.Model):
                 'message': '\n'.join(parts),
                 'type': 'warning' if (missing or not self.column_map_ids)
                         else 'success',
+                'sticky': True,
+            },
+        }
+
+    def action_check_owner_names(self):
+        """Dry-run the officer matching for every distinct value in the
+        sheet's Lead Owner Name column — nothing is imported. Shows which
+        names will match which Admission Officer and why the rest won't."""
+        self.ensure_one()
+        rows = self._fetch_rows()
+        if not rows:
+            raise UserError(_("The sheet returned no rows."))
+
+        header = [(h or '').strip().lower() for h in rows[0]]
+        owner_col = None
+        for line in self.column_map_ids:
+            if line.target_field == 'lead_owner_name':
+                key = (line.sheet_header or '').strip().lower()
+                if key in header:
+                    owner_col = header.index(key)
+                break
+        if owner_col is None:
+            raise UserError(_(
+                "No column is mapped to 'Lead Owner Name' (or its header "
+                "was not found in the sheet). Map it first."))
+
+        distinct = []
+        seen = set()
+        for row in rows[1:]:
+            cell = (row[owner_col] if owner_col < len(row) else '') or ''
+            cell = cell.strip()
+            key = self._normalize_person_name(cell)
+            if cell and key not in seen:
+                seen.add(key)
+                distinct.append(cell)
+
+        matched_lines, unmatched_lines = [], []
+        for name in distinct[:60]:
+            emp, note = self._match_employee_by_name(name)
+            if emp:
+                matched_lines.append("✓ %s  →  %s" % (name, emp.name))
+            else:
+                unmatched_lines.append("✗ %s%s" % (
+                    name, ('  (%s)' % note) if note else ''))
+
+        officer_names = sorted(set(
+            m.employee_id.name
+            for m in self.env['lead.team.member'].search([])
+            if m.employee_id.name))
+
+        parts = [_("Distinct owner names in sheet: %s") % len(distinct)]
+        if matched_lines:
+            parts.append(_("MATCHED (%s):") % len(matched_lines))
+            parts.extend(matched_lines)
+        if unmatched_lines:
+            parts.append(_("NOT MATCHED (%s) — these leads will go "
+                           "round-robin:") % len(unmatched_lines))
+            parts.extend(unmatched_lines)
+            parts.append(_("Matching only sees Admission Officers who are "
+                           "MEMBERS OF A LEAD TEAM. Current team members: "
+                           "%s") % (', '.join(officer_names) or _('(none!)')))
+            parts.append(_("To fix a name: add that person's Employee to a "
+                           "Lead Team, or rename so the names correspond "
+                           "(punctuation and case are ignored)."))
+
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _('Owner Name Check — %s matched, %s not') % (
+                    len(matched_lines), len(unmatched_lines)),
+                'message': '\n'.join(parts),
+                'type': 'warning' if unmatched_lines else 'success',
                 'sticky': True,
             },
         }

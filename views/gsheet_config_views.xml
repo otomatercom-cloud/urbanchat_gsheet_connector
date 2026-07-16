@@ -27,6 +27,9 @@
                     <button name="action_test_connection" string="Test Connection"
                             type="object" class="btn btn-secondary"
                             help="Fetches the sheet and checks the column mapping without importing anything."/>
+                    <button name="action_check_owner_names" string="Check Owner Names"
+                            type="object" class="btn btn-secondary"
+                            help="Dry-runs the officer name matching for every distinct Lead Owner Name in the sheet — shows who will match and who will fall to round-robin. Imports nothing."/>
                 </header>
                 <sheet>
                     <div class="oe_button_box" name="button_box">

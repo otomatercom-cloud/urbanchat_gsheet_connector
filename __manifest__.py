@@ -1,6 +1,6 @@
 {
     'name': 'Urban Chat — Google Sheet Lead Connector',
-    'version': '19.0.1.1.2',
+    'version': '19.0.1.2.0',
     'summary': 'Pulls leads from a Google Sheet (public CSV or OAuth) and auto-assigns '
                'by matching the sheet\'s Lead Owner Name to an Admission Officer, '
                'with round-robin fallback across a chosen team.',
