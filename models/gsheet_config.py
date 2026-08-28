@@ -549,6 +549,34 @@ class UrbanchatGsheetConfig(models.Model):
                         continue
 
                     if self.duplicate_action == 'reattempt':
+                        # ── Dedup guard: the sync cron runs every 5 minutes
+                        #    and the same sheet row matches the same
+                        #    existing lead on every run — without this
+                        #    check a new otomater.lead.reattempt record
+                        #    was created EVERY cycle for the same
+                        #    still-unreviewed duplicate, which is what
+                        #    grew that table to 920MB. Skip creating a
+                        #    new one if a recent (last 24h) reattempt for
+                        #    this exact lead already exists and is still
+                        #    pending review. See erp-tooling.md finding #45.
+                        recent_cutoff = fields.Datetime.now() - timedelta(hours=24)
+                        already_pending = self.env['otomater.lead.reattempt'].sudo().search_count([
+                            ('lead_id', '=', existing.id),
+                            ('request_date', '>=', recent_cutoff),
+                        ])
+                        if already_pending:
+                            result['skipped'] += 1
+                            Log.create({
+                                'config_id': self.id, 'row_number': row_num,
+                                'lead_id': existing.id, 'status': 'skipped',
+                                'raw_owner_name': owner_name_raw,
+                                'message': _("Duplicate by %s — a Re-Attempt "
+                                             "request for this lead was already "
+                                             "created within the last 24h; not "
+                                             "creating another.") % (
+                                    dup_type or self.duplicate_check_field),
+                            })
+                            continue
                         with self.env.cr.savepoint():
                             reattempt = self._create_reattempt_for_duplicate(
                                 existing, vals, dup_type, owner_name_raw)
@@ -570,8 +598,27 @@ class UrbanchatGsheetConfig(models.Model):
                     matched_employee, match_note = self._match_employee_by_name(owner_name_raw)
                     if matched_employee:
                         vals['lead_owner'] = matched_employee.id
-                    with self.env.cr.savepoint():
-                        existing.write(vals)
+
+                    # ── Never let a re-sync stomp an already-progressed lead's
+                    #    quality back to the sheet default. lead_quality was
+                    #    only added via vals.setdefault(...) above as a
+                    #    fallback for genuinely NEW leads — on an existing
+                    #    lead it must never override quality/state progress
+                    #    agents have made in Odoo since the row was first
+                    #    synced. Also skip writing ANY field whose value is
+                    #    unchanged, so a tracked field (lead_quality, state,
+                    #    transitions, zoom_schedule_dt, walkin_schedule_dt,
+                    #    is_forwarded) never fires a no-op tracking message
+                    #    on every 5-minute sync cycle. See erp-tooling.md
+                    #    finding #45 for the notification-storm this caused.
+                    vals.pop('lead_quality', None)
+                    diff_vals = {
+                        k: v for k, v in vals.items()
+                        if existing[k] != v
+                    }
+                    if diff_vals:
+                        with self.env.cr.savepoint():
+                            existing.write(diff_vals)
                     result['updated'] += 1
                     Log.create({
                         'config_id': self.id, 'row_number': row_num, 'lead_id': existing.id,
@@ -655,7 +702,27 @@ class UrbanchatGsheetConfig(models.Model):
             'last_sync_date': fields.Datetime.now(),
             'last_sync_summary': summary,
         })
+        self._trim_sync_logs()
         return result
+
+    def _trim_sync_logs(self, keep=100):
+        """Keep only the most recent `keep` sync-log rows for this config,
+        deleting the rest. Runs at the end of every sync (every 5 minutes
+        via cron) so urbanchat_sheet_sync_log never grows unbounded again —
+        it previously reached 1.8GB with no cap. See erp-tooling.md
+        finding #45. Deletes in small batches so this never risks the same
+        MemoryError a large unbounded delete caused elsewhere in this
+        investigation."""
+        Log = self.env['urbanchat.sheet.sync.log'].sudo()
+        for config in self:
+            stale = Log.search(
+                [('config_id', '=', config.id)],
+                order='id desc', offset=keep,
+            )
+            while stale:
+                batch = stale[:500]
+                batch.unlink()
+                stale = stale[500:]
 
     # ── Public actions ───────────────────────────────────────────────────────
     def action_test_connection(self):
