@@ -10,6 +10,7 @@
     'data': [
         'security/ir.model.access.csv',
         'data/ir_cron.xml',
+        'data/log_purge_cron.xml',
         'views/gsheet_config_views.xml',
         'views/sync_log_views.xml',
         'views/menu.xml',

@@ -705,6 +705,29 @@ class UrbanchatGsheetConfig(models.Model):
         self._trim_sync_logs()
         return result
 
+    def _purge_old_sync_logs(self, days=3):
+        """Age-based safety net alongside _trim_sync_logs' per-run count
+        cap (100/config): delete sync-log rows older than `days` across ALL
+        configs, in small batches. Runs daily via ir.cron — see
+        data/log_purge_cron.xml. urbanchat_sheet_sync_log previously grew
+        to 1.8GB with no cap of any kind; this and the per-run trim
+        together ensure it can never do that again. See erp-tooling.md
+        finding #45."""
+        from datetime import timedelta
+        Log = self.env['urbanchat.sheet.sync.log'].sudo()
+        cutoff = fields.Datetime.now() - timedelta(days=days)
+        total = 0
+        while True:
+            stale = Log.search([('create_date', '<', cutoff)], limit=2000)
+            if not stale:
+                break
+            count = len(stale)
+            stale.unlink()
+            total += count
+            if count < 2000:
+                break
+        return total
+
     def _trim_sync_logs(self, keep=100):
         """Keep only the most recent `keep` sync-log rows for this config,
         deleting the rest. Runs at the end of every sync (every 5 minutes
